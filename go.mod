@@ -12,11 +12,11 @@ require (
 	github.com/refraction-networking/utls v0.0.0-20200601200209-ada0bb9b38a0
 	github.com/seiflotfy/cuckoofilter v0.0.0-20200511222245-56093a4d3841
 	go.starlark.net v0.0.0-20200619143648-50ca820fafb9
-	golang.org/x/crypto v0.0.0-20200604202706-70a84ac30bf9
+	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
 	golang.org/x/net v0.0.0-20200602114024-627f9648deb9
 	golang.org/x/sync v0.0.0-20200317015054-43a5402ce75a
-	golang.org/x/sys v0.0.0-20200615200032-f1bc736245b1
-	google.golang.org/grpc v1.29.1
+	golang.org/x/sys v0.0.0-20200622214017-ed371f2e16b4
+	google.golang.org/grpc v1.30.0
 	google.golang.org/protobuf v1.24.0
 	h12.io/socks v1.0.0
 )
