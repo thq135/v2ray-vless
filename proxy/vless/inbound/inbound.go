@@ -172,41 +172,6 @@ func (h *Handler) RemoveUser(ctx context.Context, email string) error {
 	return nil
 }
 
-func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSession, response *protocol.RequestHeader, input buf.Reader, output *buf.BufferedWriter) error {
-
-	session.EncodeResponseHeader(response, output)
-	bodyWriter := session.EncodeResponseBody(response, output)
-
-	{
-		// Optimize for small response packet
-		data, err := input.ReadMultiBuffer()
-		if err != nil {
-			return err
-		}
-
-		if err := bodyWriter.WriteMultiBuffer(data); err != nil {
-			return err
-		}
-	}
-
-	if err := output.SetBuffered(false); err != nil {
-		return err
-	}
-
-	if err := buf.Copy(input, bodyWriter, buf.UpdateActivity(timer)); err != nil {
-		return err
-	}
-
-	// Indicates the end of transmission
-	if response.MessName == "shake" {
-		if err := bodyWriter.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // Process implements proxy.Inbound.Process().
 func (h *Handler) Process(ctx context.Context, network net.Network, connection internet.Connection, dispatcher routing.Dispatcher) error {
 	sessionPolicy := h.policyManager.ForLevel(0)
@@ -215,8 +180,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 	}
 
 	reader := &buf.BufferedReader{Reader: buf.NewReader(connection)}
-	svrSession := encoding.NewServerSession(h.clients)
-	request, err := svrSession.DecodeRequestHeader(reader)
+	request, addons, err := encoding.DecodeRequestHeader(h.clients, reader)
 	if err != nil {
 		if errors.Cause(err) != io.EOF {
 			log.Record(&log.AccessMessage{
@@ -266,10 +230,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
-		bodyReader := svrSession.DecodeRequestBody(request, reader)
+		bodyReader := encoding.DecodeAddonsBody(request, addons, reader)
 		if err := buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transfer request").Base(err)
 		}
+
 		return nil
 	}
 
@@ -279,10 +244,43 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 		writer := buf.NewBufferedWriter(buf.NewWriter(connection))
 		defer writer.Flush()
 
-		response := &protocol.RequestHeader{
-			MessName: request.MessName,
+		response := &encoding.Addons{
+			MessName: addons.MessName,
 		}
-		return transferResponse(timer, svrSession, response, link.Reader, writer)
+
+		if err := encoding.EncodeResponseHeader(request, response, writer); err != nil {
+			return newError("failed to encode response").Base(err).AtWarning()
+		}
+		bodyWriter := encoding.EncodeAddonsBody(request, response, writer)
+
+		{
+			// Optimize for small response packet
+			data, err := link.Reader.ReadMultiBuffer()
+			if err != nil {
+				return err
+			}
+
+			if err := bodyWriter.WriteMultiBuffer(data); err != nil {
+				return err
+			}
+		}
+
+		if err := writer.SetBuffered(false); err != nil {
+			return err
+		}
+
+		if err := buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer)); err != nil {
+			return err
+		}
+
+		// Indicates the end of transmission
+		if response.MessName == "shake" {
+			if err := bodyWriter.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 
 	var requestDonePost = task.OnSuccess(requestDone, task.Close(link.Writer))

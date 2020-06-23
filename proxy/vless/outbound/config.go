@@ -1,1 +1,3 @@
+// +build !confonly
+
 package outbound

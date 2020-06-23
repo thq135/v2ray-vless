@@ -48,8 +48,6 @@ type RequestHeader struct {
 	Port     net.Port
 	Address  net.Address
 	User     *MemoryUser
-	MessName string
-	MessSeed []byte
 }
 
 func (h *RequestHeader) Destination() net.Destination {

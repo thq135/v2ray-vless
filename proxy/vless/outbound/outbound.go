@@ -6,7 +6,6 @@ package outbound
 
 import (
 	"context"
-	"math/rand"
 	"time"
 
 	"v2ray.com/core"
@@ -29,8 +28,6 @@ func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return New(ctx, config.(*Config))
 	}))
-
-	rand.Seed(time.Now().UnixNano())
 }
 
 // Handler is an outbound connection handler for VLess protocol.
@@ -98,20 +95,24 @@ func (v *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	request := &protocol.RequestHeader{
+		Version: encoding.Version,
 		User:    rec.PickUser(),
 		Command: command,
 		Address: target.Address,
 		Port:    target.Port,
+		//Option:  protocol.RequestOptionChunkStream,
 	}
 
 	account := request.User.Account.(*vless.MemoryAccount)
-	request.MessName = account.Mess
 	//request.Security = account.Security
+
+	addons := &encoding.Addons{
+		MessName: account.Mess,
+	}
 
 	input := link.Reader
 	output := link.Writer
 
-	session := encoding.NewClientSession()
 	sessionPolicy := v.policyManager.ForLevel(request.User.Level)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -121,11 +122,11 @@ func (v *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
 		writer := buf.NewBufferedWriter(buf.NewWriter(conn))
-		if err := session.EncodeRequestHeader(request, writer); err != nil {
+		if err := encoding.EncodeRequestHeader(request, addons, writer); err != nil {
 			return newError("failed to encode request").Base(err).AtWarning()
 		}
 
-		bodyWriter := session.EncodeRequestBody(request, writer)
+		bodyWriter := encoding.EncodeAddonsBody(request, addons, writer)
 		if err := buf.CopyOnceTimeout(input, bodyWriter, time.Millisecond*100); err != nil && err != buf.ErrNotTimeoutReader && err != buf.ErrReadTimeout {
 			return newError("failed to write first payload").Base(err)
 		}
@@ -139,7 +140,7 @@ func (v *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		// Indicates the end of transmission
-		if request.MessName == "shake" {
+		if addons.MessName == "shake" {
 			if err := bodyWriter.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
 				return err
 			}
@@ -152,12 +153,12 @@ func (v *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		reader := &buf.BufferedReader{Reader: buf.NewReader(conn)}
-		response, err := session.DecodeResponseHeader(reader)
+		response, err := encoding.DecodeResponseHeader(request, reader)
 		if err != nil {
 			return newError("failed to read header").Base(err)
 		}
 
-		bodyReader := session.DecodeResponseBody(response, reader)
+		bodyReader := encoding.DecodeAddonsBody(request, response, reader)
 
 		return buf.Copy(bodyReader, output, buf.UpdateActivity(timer))
 	}
