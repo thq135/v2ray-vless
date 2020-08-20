@@ -51,10 +51,8 @@ type Handler struct {
 	policyManager         policy.Manager
 	validator             *vless.Validator
 	dns                   dns.Client
-	fallback              *Fallback // or nil
-	addrport              string
-	fallback_h2           *FallbackH2 // or nil
-	addrport_h2           string
+	fallbacks             []*Fallback // or nil
+	//regexps               sync.Map
 }
 
 // New creates a new VLess inbound handler.
@@ -66,9 +64,10 @@ func New(ctx context.Context, config *Config, dc dns.Client) (*Handler, error) {
 		policyManager:         v.GetFeature(policy.ManagerType()).(policy.Manager),
 		validator:             new(vless.Validator),
 		dns:                   dc,
+		fallbacks:             config.Fallbacks,
 	}
 
-	for _, user := range config.User {
+	for _, user := range config.Clients {
 		u, err := user.ToMemoryUser()
 		if err != nil {
 			return nil, newError("failed to get VLESS user").Base(err).AtError()
@@ -77,16 +76,19 @@ func New(ctx context.Context, config *Config, dc dns.Client) (*Handler, error) {
 			return nil, newError("failed to initiate user").Base(err).AtError()
 		}
 	}
-
-	if config.Fallback != nil {
-		handler.fallback = config.Fallback
-		handler.addrport = handler.fallback.Addr.AsAddress().String() + ":" + strconv.Itoa(int(handler.fallback.Port))
-	}
-	if config.FallbackH2 != nil {
-		handler.fallback_h2 = config.FallbackH2
-		handler.addrport_h2 = handler.fallback_h2.Addr.AsAddress().String() + ":" + strconv.Itoa(int(handler.fallback_h2.Port))
-	}
-
+	/*
+		if handler.fallbacks != nil {
+			for _, fb := range handler.fallbacks {
+				if fb.Path != "" {
+					if r, err := regexp.Compile(fb.Path); err != nil {
+						return nil, newError("invalid path regexp").Base(err).AtError()
+					} else {
+						handler.regexps.Store(fb.Path, r)
+					}
+				}
+			}
+		}
+	*/
 	return handler, nil
 }
 
@@ -118,11 +120,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 		return newError("unable to set read deadline").Base(err).AtWarning()
 	}
 
+	sid := session.ExportIDToError(ctx)
+
 	first := buf.New()
 	first.ReadFrom(connection)
 
-	sid := session.ExportIDToError(ctx)
-	newError("firstLen = ", first.Len()).AtInfo().WriteToLog(sid)
+	firstLen := first.Len()
+	newError("firstLen = ", firstLen).AtInfo().WriteToLog(sid)
 
 	reader := &buf.BufferedReader{
 		Reader: buf.NewReader(connection),
@@ -134,61 +138,110 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 	var err error
 	var pre *buf.Buffer
 
-	fallback := 0
-	if h.fallback != nil {
-		fallback = 1
+	isfb := false
+	if h.fallbacks != nil {
+		isfb = true
 	}
 
-	if fallback == 1 && first.Len() < 18 {
+	if isfb && firstLen < 18 {
 		err = newError("fallback directly")
 	} else {
 		request, requestAddons, err, pre = encoding.DecodeRequestHeader(reader, h.validator)
 		if pre == nil {
-			fallback = 0
+			isfb = false
 		}
 	}
 
 	if err != nil {
 
-		if fallback == 1 {
-			if h.fallback_h2 != nil {
+		if isfb {
+
+			newError("fallback starts").Base(err).AtInfo().WriteToLog(sid)
+
+			fallbacks := make(map[string]map[string]*Fallback)
+			for _, fb := range h.fallbacks {
+				if fallbacks[fb.Alpn] == nil {
+					fallbacks[fb.Alpn] = make(map[string]*Fallback)
+				}
+				fallbacks[fb.Alpn][fb.Path] = fb
+			}
+
+			alpn := ""
+			path := ""
+
+			if len(fallbacks) > 1 || fallbacks[""] == nil {
 				iConn := connection
 				if statConn, ok := iConn.(*internet.StatCouterConnection); ok {
 					iConn = statConn.Connection
 				}
 				if tlsConn, ok := iConn.(*tls.Conn); ok {
-					if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-						fallback = 2
+					alpn = tlsConn.ConnectionState().NegotiatedProtocol
+					newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
+					if fallbacks[alpn] == nil {
+						alpn = ""
 					}
 				}
 			}
+			newError("fallback as alpn \"" + alpn + "\"").AtInfo().WriteToLog(sid)
+			if fallbacks[alpn] == nil {
+				return newError("failed to find the default config").AtWarning()
+			}
 
-			var addrport string
-			var unixpath string
-			var proxyver uint32
-
-			switch fallback {
-			case 1:
-				addrport = h.addrport
-				unixpath = h.fallback.Unix
-				proxyver = h.fallback.Xver
-				newError("fallback starts").Base(err).AtInfo().WriteToLog(sid)
-			case 2:
-				addrport = h.addrport_h2
-				unixpath = h.fallback_h2.Unix
-				proxyver = h.fallback_h2.Xver
-				newError("fallback_h2 starts").Base(err).AtInfo().WriteToLog(sid)
+			if len(fallbacks[alpn]) > 1 || fallbacks[alpn][""] == nil {
+				/*
+					if lines := bytes.Split(firstBytes, []byte{'\r', '\n'}); len(lines) > 1 {
+						if s := bytes.Split(lines[0], []byte{' '}); len(s) == 3 {
+							if len(s[0]) < 8 && len(s[1]) > 0 && len(s[2]) == 8 {
+								newError("realPath = " + string(s[1])).AtInfo().WriteToLog(sid)
+								for _, fb := range fallbacks[alpn] {
+									if fb.Path != "" {
+										if r, _ := h.regexps.Load(fb.Path); r != nil {
+											if r.(*regexp.Regexp).Match(s[1]) {
+												path = fb.Path
+												break
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				*/
+				if pre != nil && pre.Len() == 1 { // firstLen >= 18 && invalid request version
+					firstBytes := first.Bytes()
+					for i := 3; i < len(firstBytes); i++ {
+						if firstBytes[i] == '/' && firstBytes[i-1] == ' ' {
+							for j := i + 1; j < len(firstBytes); j++ {
+								if firstBytes[j] == ' ' || firstBytes[j] == '\r' || firstBytes[j] == '\n' {
+									realPath := string(firstBytes[i:j])
+									newError("realPath = " + realPath).AtInfo().WriteToLog(sid)
+									for _, fb := range fallbacks[alpn] {
+										if fb.Path == realPath {
+											path = fb.Path
+											break
+										}
+									}
+									break
+								}
+							}
+							break
+						}
+						if i == 7 {
+							break
+						}
+					}
+				}
+			}
+			newError("fallback as path \"" + path + "\"").AtInfo().WriteToLog(sid)
+			fb := fallbacks[alpn][path]
+			if fb == nil {
+				return newError("failed to find the default config").AtWarning()
 			}
 
 			var conn net.Conn
 			if err := retry.ExponentialBackoff(5, 100).On(func() error {
 				var dialer net.Dialer
-				var err error
-				if unixpath != "" {
-					conn, err = dialer.DialContext(ctx, "unix", unixpath)
-				} else {
-					conn, err = dialer.DialContext(ctx, "tcp", addrport)
-				}
+				conn, err = dialer.DialContext(ctx, fb.Type, fb.Dest)
 				if err != nil {
 					return err
 				}
@@ -208,7 +261,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 
 			postRequest := func() error {
 				defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-				if proxyver > 0 {
+				if fb.Xver != 0 {
 					remoteAddr, remotePort, err := net.SplitHostPort(connection.RemoteAddr().String())
 					if err != nil {
 						return err
@@ -225,7 +278,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 						}
 					}
 					pro := buf.New()
-					switch proxyver {
+					switch fb.Xver {
 					case 1:
 						if ipv4 {
 							pro.Write([]byte("PROXY TCP4 " + remoteAddr + " " + localAddr + " " + remotePort + " " + localPort + "\r\n"))
@@ -257,7 +310,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 						pro.Write(b2)
 					}
 					if err := serverWriter.WriteMultiBuffer(buf.MultiBuffer{pro}); err != nil {
-						return newError("failed to set PROXY protocol v", proxyver).Base(err).AtWarning()
+						return newError("failed to set PROXY protocol v", fb.Xver).Base(err).AtWarning()
 					}
 				}
 				if pre != nil && pre.Len() > 0 {
